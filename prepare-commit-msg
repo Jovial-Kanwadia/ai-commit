@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# .githooks/prepare-commit-msg
+# Generate a concise Conventional Commit header using Gemini for staged changes.
+# Safe: never fails the commit; writes helpful comment messages on error.
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="$2"
+
+# Allowed commit types
+ALLOWED_TYPES="feat|fix|refactor|style|docs|chore|perf|build"
+
+# CONFIG: tune if needed
+MAX_DIFF_CHARS=15000          # maximum number of characters from diff to send
+MODEL="gemini-2.5-flash"
+TEMPERATURE=0.12
+MAX_OUTPUT_TOKENS=200
+
+# helper temp files
+TMP="$(mktemp)"
+TMP_RESP="$(mktemp)"
+
+cleanup() {
+  rm -f -- "$TMP" "$TMP_RESP"
+}
+trap cleanup EXIT
+
+# Don't run for merges / commit --amend / non-interactive sources
+if [[ -n "$COMMIT_SOURCE" ]]; then
+  exit 0
+fi
+
+# If the commit message file already has a real message (non-comment), do nothing.
+# This prevents overwriting explicit -m / prepared messages.
+if grep -q '^[^#[:space:]]' "$COMMIT_MSG_FILE"; then
+  exit 0
+fi
+
+# Ensure jq & curl exist
+if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+  {
+    echo "# 🚨 AI HOOK ERROR: This hook requires 'jq' and 'curl'."
+    echo "# Install on Arch: sudo pacman -S jq curl"
+  } > "$TMP"
+  cat "$COMMIT_MSG_FILE" >> "$TMP"
+  mv "$TMP" "$COMMIT_MSG_FILE"
+  exit 0
+fi
+
+# Grab staged diff (no color)
+DIFF="$(git diff --cached --no-color)"
+if [[ -z "$DIFF" ]]; then
+  exit 0
+fi
+
+# Try to locate the Gemini API key from multiple safe locations.
+# Priority: environment variable -> git config (local then global) -> ~/.gemini_api_key
+get_api_key() {
+  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    printf '%s' "$GEMINI_API_KEY"
+    return
+  fi
+
+  # local repo config
+  key="$(git config --local --get gemini.apikey 2>/dev/null || true)"
+  if [[ -n "$key" ]]; then printf '%s' "$key"; return; fi
+
+  # global config
+  key="$(git config --global --get gemini.apikey 2>/dev/null || true)"
+  if [[ -n "$key" ]]; then printf '%s' "$key"; return; fi
+
+  # fallback to file in home (user-managed, recommended)
+  if [[ -r "${HOME}/.gemini_api_key" ]]; then
+    # read first non-empty line
+    key="$(sed -n '/\S/ { p; q; }' "${HOME}/.gemini_api_key")"
+    if [[ -n "$key" ]]; then printf '%s' "$key"; return; fi
+  fi
+}
+
+API_KEY="$(get_api_key)"
+
+if [[ -z "$API_KEY" ]]; then
+  {
+    echo "# 🚨 AI HOOK ERROR: Gemini API key not found."
+    echo "# Please export GEMINI_API_KEY, set git config gemini.apikey, or create ~/.gemini_api_key"
+    echo "# Example (Fish): set -gx GEMINI_API_KEY \"your_key_here\""
+  } > "$TMP"
+  cat "$COMMIT_MSG_FILE" >> "$TMP"
+  mv "$TMP" "$COMMIT_MSG_FILE"
+  exit 0
+fi
+
+# Truncate the diff reasonably to avoid huge payloads
+DIFF_TRUNCATED="$(printf '%s' "$DIFF" | head -c "$MAX_DIFF_CHARS")"
+
+# Improved prompt to get short, deterministic, conventional commit header.
+read -r -d '' PROMPT <<'EOF'
+You are an expert software engineer and git historian. Analyze the staged git diff and produce
+a single concise Conventional Commit header (one line) that best summarizes the change.
+
+Rules (strict):
+- Output ONLY the commit header (no explanation, no code blocks, no markdown).
+- Header format: <type>(<scope>): <short description>
+  - Allowed types: feat, fix, refactor, style, docs, chore, perf, build
+  - Scope is optional: use one short word (e.g. linux, build, README, sdl) if you can infer it.
+- Use imperative present tense ("add", "fix", "remove").
+- Keep the short description <= 50 characters (truncate politely if needed).
+- Do NOT include issue numbers, stack traces, or file diffs in the header.
+- If the change is only documentation, use docs: ...
+- If you cannot determine a type confidently, prefer chore.
+- If necessary, you may output a second paragraph (separated by a blank line) with a short 72-char-wrap body explaining 1-2 bullets of what changed — but prefer a single-line header.
+
+Examples of perfect output:
+feat(sdl): add SDL2 linux platform layer
+fix(build): correct -lSDL2 linking in build.sh
+docs: update README with SDL2 instructions
+
+Negative / unacceptable output:
+- "I changed these files: ..." (no)
+- Multi-line essays (no)
+- Quoted strings or markdown (no)
+
+Now analyze the following diff and output only the commit header (and optionally a very short body if critical).
+Diff:
+EOF
+
+# Build payload with jq to avoid quoting problems
+PAYLOAD="$(jq -n \
+  --arg prompt "$PROMPT" \
+  --arg diff "$DIFF_TRUNCATED" \
+  --argjson genConfig "$(jq -n --arg temp "$TEMPERATURE" --argjson maxTok "$MAX_OUTPUT_TOKENS" '{temperature: ($temp|tonumber), maxOutputTokens: $maxTok|tonumber}')" \
+  '{
+    "contents": [{ "parts": [{ "text": ($prompt + "\n\n" + $diff) }] }],
+    "generationConfig": ($genConfig)
+  }')"
+
+# Call Gemini generate endpoint (key in query param)
+URL="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}"
+HTTP_RESPONSE="$(curl -sS -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$URL")"
+HTTP_BODY="${HTTP_RESPONSE::-3}"
+HTTP_CODE="${HTTP_RESPONSE: -3}"
+
+if [[ "$HTTP_CODE" != "200" ]]; then
+  ERR_MSG="$(printf '%s' "$HTTP_BODY" | jq -r '.error.message // .error // "unknown error"')"
+  {
+    echo "# 🚨 GEMINI API ERROR (HTTP $HTTP_CODE): $ERR_MSG"
+    echo "# Raw response saved to a temporary file for debugging."
+  } > "$TMP"
+  printf '%s\n' "$HTTP_BODY" > "${TMP}.resp"
+  cat "$COMMIT_MSG_FILE" >> "$TMP"
+  mv "$TMP" "$COMMIT_MSG_FILE"
+  exit 0
+fi
+
+# Attempt to extract text from several common shapes of Gemini responses.
+SUGGESTION="$(printf '%s' "$HTTP_BODY" | jq -r '
+  ( .candidates[0].content.parts[0].text // 
+    .candidates[0].content[0].text // 
+    .output[0].content[0].text // 
+    .candidates[0].content[0].payload // 
+    .candidates[0].content[0].message // 
+    .text ) 
+  // empty
+')"
+
+# trim whitespace
+SUGGESTION="$(printf '%s' "$SUGGESTION" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+# If no suggestion, write an error comment and exit
+if [[ -z "$SUGGESTION" ]]; then
+  {
+    echo "# 🚨 GEMINI returned no text suggestion."
+    echo "# Raw response saved for debugging."
+  } > "$TMP"
+  printf '%s\n' "$HTTP_BODY" > "${TMP}.resp"
+  cat "$COMMIT_MSG_FILE" >> "$TMP"
+  mv "$TMP" "$COMMIT_MSG_FILE"
+  exit 0
+fi
+
+# Get first non-empty line (we prefer one-line header)
+HEADER="$(printf '%s' "$SUGGESTION" | sed -n '/\S/ { p; q; }' )"
+# Ensure it's one line
+HEADER="$(printf '%s' "$HEADER" | head -n1)"
+
+# Function to truncate at word boundary to <= N chars
+truncate_to_n() {
+  local input="$1"; local N="$2"
+  if [[ ${#input} -le $N ]]; then
+    printf '%s' "$input"; return
+  fi
+  # cut to N then remove trailing fragment
+  local truncated="${input:0:$N}"
+  # remove trailing incomplete word
+  truncated="$(printf '%s' "$truncated" | sed -E 's/[[:space:]]+[[:alnum:]]*$//')"
+  # ensure we still have something
+  if [[ -z "$truncated" ]]; then truncated="${input:0:$N}"; fi
+  printf '%s' "$truncated"
+}
+
+HEADER="$(truncate_to_n "$HEADER" 50)"
+
+# If the header does not match Conventional Commit pattern, try to normalize:
+if ! printf '%s' "$HEADER" | grep -Eq "^(${ALLOWED_TYPES})(\\([a-zA-Z0-9_.-]+\\))?:\\s+.{1,50}$"; then
+  # attempt to infer type 'chore' + short description
+  # use first verb-like phrase from suggestion
+  DESC="$(printf '%s' "$SUGGESTION" | sed -n '1p' | sed -E 's/^[A-Z]+: //I')"
+  DESC="$(echo "$DESC" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+  DESC="$(truncate_to_n "$DESC" 47)"
+  HEADER="chore: $DESC"
+fi
+
+# Write the header into the commit message file, preserving any existing template/comments
+{
+  printf '%s\n\n' "$HEADER"
+  # append any existing commit message (comments/templates) so user can edit
+  cat "$COMMIT_MSG_FILE"
+} > "${COMMIT_MSG_FILE}.tmp" && mv "${COMMIT_MSG_FILE}.tmp" "$COMMIT_MSG_FILE"
+
+# done (exit 0 so commit continues)
+exit 0
